@@ -178,6 +178,7 @@ function errorResponse(error: unknown): Response {
     UNAUTHORIZED: [401, "驗證失敗，請重新進入課程"],
     FORBIDDEN: [403, "沒有權限執行此操作"],
     INVALID_MODULE: [400, "找不到指定模組"],
+    INVALID_ANSWERS: [400, "請完成本模組全部 25 題"],
     NOT_ELIGIBLE: [409, "尚未達到證書核發條件"],
     "答案數量不完整": [400, "請完成所有題目"],
     "題目不可重複": [400, "題目資料錯誤"],
@@ -248,16 +249,9 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (request.method === "POST" && moduleMatch) {
     const moduleId = moduleMatch[1]!;
     const body = await readJson(request);
-    const result = grade("module", moduleId, answerList(body.answers));
+    const result = grade(moduleId, answerList(body.answers));
     await store.recordModuleScore(await learnerHash(request), moduleId, result.score, PASSING_SCORE);
     return json({ ok: true, ...result, passed: result.score >= PASSING_SCORE });
-  }
-
-  if (request.method === "POST" && path === "/api/final/submit") {
-    const body = await readJson(request);
-    const result = grade("final", null, answerList(body.answers));
-    await store.recordFinalScore(await learnerHash(request), result.score);
-    return json({ ok: true, score: result.score, correct: result.correct, total: result.total, passed: result.score >= PASSING_SCORE });
   }
 
   if (request.method === "POST" && path === "/api/lesson-plan") {
@@ -355,7 +349,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       if (offset >= page.total || page.rows.length === 0) break;
     }
     const csvRows = [
-      ["姓名", "學校", "Email", "有效學習分鐘", "總測驗", "完成時間", "證書編號"],
+      ["姓名", "學校", "Email", "有效學習分鐘", "六卷評量平均", "完成時間", "證書編號"],
       ...allRows.map((row) => [
         row.name,
         row.school,

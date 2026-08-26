@@ -36,19 +36,18 @@ describe("認證資料層", () => {
   it("只計入合理間隔的有效學習秒數", async () => {
     const token = await createLearner();
     const start = Date.now();
-    expect((await store.heartbeat(token, start, "construction")).activeSeconds).toBe(0);
-    expect((await store.heartbeat(token, start + 30_000, "construction")).activeSeconds).toBe(30);
-    expect((await store.heartbeat(token, start + 300_000, "construction")).activeSeconds).toBe(30);
+    expect((await store.heartbeat(token, start, "framing")).activeSeconds).toBe(0);
+    expect((await store.heartbeat(token, start + 30_000, "framing")).activeSeconds).toBe(30);
+    expect((await store.heartbeat(token, start + 300_000, "framing")).activeSeconds).toBe(30);
   });
 
   it("完成四項條件後核發唯一證書並可公開遮罩驗證", async () => {
     const token = await createLearner();
-    await store.heartbeat(token, 1_000_000, "construction");
-    await store.heartbeat(token, 1_030_000, "construction");
-    for (const moduleId of ["construction", "verification", "deepfake"]) {
+    await store.heartbeat(token, 1_000_000, "framing");
+    await store.heartbeat(token, 1_030_000, "framing");
+    for (const moduleId of ["framing", "advertising", "representation", "verification", "platforms", "deepfake"]) {
       await store.recordModuleScore(token, moduleId, 100, 80);
     }
-    await store.recordFinalScore(token, 100);
     await store.saveLessonPlan(token, {
       title: "新聞標題拆解",
       audience: "八年級",

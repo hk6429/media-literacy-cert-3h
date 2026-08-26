@@ -109,7 +109,6 @@
     return {
       time: learner.activeSeconds >= required,
       modules: modulesDone === state.course.modules.length,
-      final: (learner.final?.bestScore || 0) >= state.course.passingScore,
       plan: !!learner.lessonPlan,
       modulesDone,
     };
@@ -138,40 +137,67 @@
           const progress = learner.modules[module.id];
           const passed = progress?.bestScore >= state.course.passingScore;
           return `<article class="module-card ${passed ? "done" : ""}">
-            <p class="module-number">0${index + 1}</p>
+            <img src="${escapeHtml(module.image)}" alt="${escapeHtml(module.imageAlt)}" loading="lazy">
+            <div class="module-card-body"><p class="module-number">卷 ${index + 1}</p>
             <h3>${escapeHtml(module.title)}</h3>
             <p>${escapeHtml(module.summary)}</p>
+            <p class="module-meta">${module.minutes} 分鐘・25 題評量</p>
             <p class="status-line">${passed ? `已通過・最佳 ${progress.bestScore} 分` : progress ? `最佳 ${progress.bestScore} 分・尚未通過` : "尚未開始"}</p>
             <button class="button ${passed ? "secondary" : "primary"} open-module" data-module="${module.id}" type="button">${passed ? "複習模組" : "開始模組"}</button>
-          </article>`;
+            </div></article>`;
         }).join("")}
       </div>
       <div class="completion-grid">
-        <button class="task-card" id="open-final" type="button"><span>${checklist.final ? "已完成" : "待完成"}</span><strong>綜合總測驗</strong><small>${learner.final ? `最佳 ${learner.final.bestScore} 分` : "12 題・80 分通過"}</small></button>
         <button class="task-card" id="open-plan" type="button"><span>${checklist.plan ? "已完成" : "待完成"}</span><strong>一頁微教案</strong><small>把研習內容帶回教室</small></button>
         <button class="task-card certificate-task" id="open-certificate" type="button"><span>${learner.certificateCode ? "已核發" : "最後一步"}</span><strong>課程完成證書</strong><small>${learner.certificateCode || "完成全部條件後開放"}</small></button>
       </div>
       <ul class="checklist" aria-label="證書完成條件">
         <li class="${checklist.time ? "complete" : ""}">有效學習 180 分鐘</li>
-        <li class="${checklist.modules ? "complete" : ""}">三個模組均達 80 分（${checklist.modulesDone}/3）</li>
-        <li class="${checklist.final ? "complete" : ""}">總測驗達 80 分</li>
+        <li class="${checklist.modules ? "complete" : ""}">六個模組、150 題均完成且各卷達 80 分（${checklist.modulesDone}/6）</li>
         <li class="${checklist.plan ? "complete" : ""}">完成一頁微教案</li>
       </ul>`;
     document.querySelector("#backup-token").addEventListener("click", tokenBackup);
     document.querySelectorAll(".open-module").forEach((button) => button.addEventListener("click", () => renderModule(button.dataset.module)));
-    document.querySelector("#open-final").addEventListener("click", renderFinal);
     document.querySelector("#open-plan").addEventListener("click", renderLessonPlan);
     document.querySelector("#open-certificate").addEventListener("click", handleCertificate);
   }
 
   function questionForm(questions, id, submitText) {
     return `<form id="${id}" class="quiz-form">
-      ${questions.map((question, index) => `<fieldset>
-        <legend>${index + 1}. ${escapeHtml(question.prompt)}</legend>
-        ${question.options.map((option, optionIndex) => `<label><input type="radio" name="${question.id}" value="${optionIndex}" required> ${escapeHtml(option)}</label>`).join("")}
-      </fieldset>`).join("")}
-      <button class="button primary" type="submit">${submitText}</button>
+      <div class="quiz-progress"><span>評量進度</span><strong id="quiz-page-label">第 1 組／共 5 組</strong></div>
+      ${Array.from({ length: 5 }, (_, page) => `<section class="question-page" data-page="${page}" ${page === 0 ? "" : "hidden"}>
+      ${questions.slice(page * 5, page * 5 + 5).map((question, localIndex) => `<fieldset>
+        <legend>${page * 5 + localIndex + 1}. ${escapeHtml(question.prompt)}</legend>
+        ${question.options.map((option, optionIndex) => `<label><input type="radio" name="${question.id}" value="${optionIndex}"> <span>${escapeHtml(option)}</span></label>`).join("")}
+      </fieldset>`).join("")}</section>`).join("")}
+      <div class="quiz-nav"><button class="button secondary quiz-prev" type="button" hidden>上一組</button><button class="button primary quiz-next" type="button">下一組</button><button class="button primary quiz-submit" type="submit" hidden>${submitText}</button></div>
+      <div class="quiz-page-message" aria-live="polite"></div>
     </form>`;
+  }
+
+  function bindQuizPagination(form, questions) {
+    let page = 0;
+    const pages = [...form.querySelectorAll(".question-page")];
+    const prev = form.querySelector(".quiz-prev");
+    const next = form.querySelector(".quiz-next");
+    const submit = form.querySelector(".quiz-submit");
+    const label = form.querySelector("#quiz-page-label");
+    const message = form.querySelector(".quiz-page-message");
+    const show = () => {
+      pages.forEach((item, index) => { item.hidden = index !== page; });
+      prev.hidden = page === 0;
+      next.hidden = page === pages.length - 1;
+      submit.hidden = page !== pages.length - 1;
+      label.textContent = `第 ${page + 1} 組／共 ${pages.length} 組`;
+      message.innerHTML = "";
+    };
+    const pageComplete = () => questions.slice(page * 5, page * 5 + 5).every((question) => form.querySelector(`input[name="${question.id}"]:checked`));
+    next.addEventListener("click", () => {
+      if (!pageComplete()) { message.innerHTML = `<p class="alert error">請先完成這一組 5 題。</p>`; return; }
+      page += 1; show(); form.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    prev.addEventListener("click", () => { page -= 1; show(); form.scrollIntoView({ behavior: "smooth", block: "start" }); });
+    show();
   }
 
   function renderModule(moduleId) {
@@ -183,15 +209,16 @@
     app.className = "panel lesson-view";
     app.innerHTML = `
       <button class="back-button" type="button">← 回課程總覽</button>
-      <p class="eyebrow">建議學習 ${module.minutes} 分鐘</p>
-      <h2>${escapeHtml(module.title)}</h2>
-      <p class="lead">${escapeHtml(module.summary)}</p>
+      <figure class="lesson-hero"><img src="${escapeHtml(module.image)}" alt="${escapeHtml(module.imageAlt)}"><figcaption><p class="eyebrow">第 ${state.course.modules.indexOf(module) + 1} 卷・${module.minutes} 分鐘</p><h2>${escapeHtml(module.title)}</h2><p>${escapeHtml(module.guide)}</p></figcaption></figure>
       <div class="objectives"><h3>完成後，我能夠</h3><ul>${module.objectives.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>
-      ${module.sections.map((section) => `<article class="lesson-section"><h3>${escapeHtml(section.title)}</h3>${section.content.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("")}${section.activity ? `<div class="activity"><strong>動手做</strong><p>${escapeHtml(section.activity)}</p></div>` : ""}</article>`).join("")}
-      <div class="source-box"><strong>延伸來源</strong>${module.sources.map((source) => `<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener">${escapeHtml(source.label)}</a>`).join("")}</div>
-      <section class="quiz-section"><p class="eyebrow">形成性評量</p><h3>模組小測驗</h3><p>四題全答，80 分以上通過。答錯會提供說明，可立即再試。</p>${questionForm(questions, "module-quiz", "送出模組測驗")}<div id="quiz-result" aria-live="polite"></div></section>`;
+      <nav class="lesson-toc" aria-label="本卷教材目錄"><strong>本卷教材</strong>${module.sections.map((section, index) => `<a href="#lesson-section-${index + 1}">${index + 1}. ${escapeHtml(section.title.replace(/^.+?、/, ""))}</a>`).join("")}</nav>
+      ${module.sections.map((section, index) => `<article id="lesson-section-${index + 1}" class="lesson-section"><p class="section-number">${String(index + 1).padStart(2, "0")}</p><h3>${escapeHtml(section.title)}</h3>${section.content.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("")}${section.caseStudy ? `<div class="case-study"><strong>案例卷宗</strong><p>${escapeHtml(section.caseStudy)}</p></div>` : ""}${section.activity ? `<div class="activity"><strong>動手做</strong><p>${escapeHtml(section.activity)}</p></div>` : ""}</article>`).join("")}
+      <div class="source-box"><strong>本卷素材依據</strong>${module.sources.map((source) => `<article><h4>${source.url ? `<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener">${escapeHtml(source.label)}</a>` : escapeHtml(source.label)}</h4><p>${escapeHtml(source.note)}</p></article>`).join("")}</div>
+      <section class="quiz-section"><p class="eyebrow">本卷評量</p><h3>25 題全部作答，80 分以上通過</h3><p>題目分成五組，每組五題。答錯後會看到解析，可重新閱讀並再試。</p>${questionForm(questions, "module-quiz", "送出本卷 25 題")}<div id="quiz-result" aria-live="polite"></div></section>`;
     document.querySelector(".back-button").addEventListener("click", () => renderDashboard());
-    document.querySelector("#module-quiz").addEventListener("submit", (event) => submitQuiz(event, "module", moduleId, questions));
+    const quizForm = document.querySelector("#module-quiz");
+    bindQuizPagination(quizForm, questions);
+    quizForm.addEventListener("submit", (event) => submitQuiz(event, moduleId, questions));
     window.scrollTo({ top: app.offsetTop - 20, behavior: "smooth" });
   }
 
@@ -200,13 +227,17 @@
     return questions.map((question) => ({ id: question.id, answer: Number(data.get(question.id)) }));
   }
 
-  async function submitQuiz(event, kind, moduleId, questions) {
+  async function submitQuiz(event, moduleId, questions) {
     event.preventDefault();
+    const answers = answersFromForm(event.currentTarget, questions);
+    if (answers.some((item) => !Number.isInteger(item.answer))) {
+      event.currentTarget.querySelector(".quiz-page-message").innerHTML = `<p class="alert error">請完成全部 25 題後再送出。</p>`;
+      return;
+    }
     const button = event.currentTarget.querySelector("button[type=submit]");
     button.disabled = true;
     try {
-      const path = kind === "final" ? "/api/final/submit" : `/api/modules/${moduleId}/submit`;
-      const result = await api(path, { method: "POST", body: JSON.stringify({ answers: answersFromForm(event.currentTarget, questions) }) });
+      const result = await api(`/api/modules/${moduleId}/submit`, { method: "POST", body: JSON.stringify({ answers }) });
       const container = document.querySelector("#quiz-result");
       container.innerHTML = `<div class="alert ${result.passed ? "success" : "error"}"><strong>${result.score} 分・${result.passed ? "通過" : "尚未通過"}</strong>${result.details ? `<ul>${result.details.map((item) => `<li>${item.correct ? "答對" : "再想想"}：${escapeHtml(item.explanation)}</li>`).join("")}</ul>` : ""}</div>`;
       await loadLearner();
@@ -218,18 +249,8 @@
     }
   }
 
-  function renderFinal() {
-    state.activeModule = "deepfake";
-    const questions = state.course.finalQuestions;
-    app.className = "panel lesson-view";
-    app.innerHTML = `<button class="back-button" type="button">← 回課程總覽</button><p class="eyebrow">總結評量</p><h2>媒體素養綜合測驗</h2><p class="lead">共 12 題，80 分以上通過。題目涵蓋媒體建構、資訊查證與 AI 深偽。</p>${questionForm(questions, "final-quiz", "送出總測驗")}<div id="quiz-result" aria-live="polite"></div>`;
-    document.querySelector(".back-button").addEventListener("click", () => renderDashboard());
-    document.querySelector("#final-quiz").addEventListener("submit", (event) => submitQuiz(event, "final", null, questions));
-    window.scrollTo({ top: app.offsetTop - 20, behavior: "smooth" });
-  }
-
   function renderLessonPlan() {
-    state.activeModule = "construction";
+    state.activeModule = "framing";
     const plan = state.learner.lessonPlan || {};
     app.className = "panel lesson-view";
     app.innerHTML = `<button class="back-button" type="button">← 回課程總覽</button><p class="eyebrow">教學轉化</p><h2>一頁媒體素養微教案</h2><p class="lead">不用寫長篇教案，請把一個概念轉成下一週真的能進教室的活動。</p>

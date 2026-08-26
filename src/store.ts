@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { MODULE_IDS } from "./course-content";
 
 export type EnrollInput = {
   id: string;
@@ -56,8 +57,6 @@ type CompletionRow = {
   certificate_code: string;
   lesson_plan_json: string;
 };
-
-const MODULE_IDS = ["construction", "verification", "deepfake"];
 
 export class CertificationStore extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -207,24 +206,6 @@ export class CertificationStore extends DurableObject<Env> {
     this.ctx.storage.sql.exec("UPDATE learners SET updated_at = ? WHERE id = ?", now, learner.id);
   }
 
-  async recordFinalScore(tokenHash: string, score: number): Promise<void> {
-    const learner = this.findLearner(tokenHash);
-    if (!learner) throw new Error("UNAUTHORIZED");
-    const now = Date.now();
-    this.ctx.storage.sql.exec(
-      `INSERT INTO final_attempts (learner_id, best_score, attempts, last_submitted_at)
-       VALUES (?, ?, 1, ?)
-       ON CONFLICT(learner_id) DO UPDATE SET
-         best_score = MAX(final_attempts.best_score, excluded.best_score),
-         attempts = final_attempts.attempts + 1,
-         last_submitted_at = excluded.last_submitted_at`,
-      learner.id,
-      score,
-      now,
-    );
-    this.ctx.storage.sql.exec("UPDATE learners SET updated_at = ? WHERE id = ?", now, learner.id);
-  }
-
   async saveLessonPlan(tokenHash: string, plan: LessonPlan): Promise<void> {
     const learner = this.findLearner(tokenHash);
     if (!learner) throw new Error("UNAUTHORIZED");
@@ -249,13 +230,26 @@ export class CertificationStore extends DurableObject<Env> {
       return { ok: true, code: learner.certificate_code, completedAt: learner.completed_at };
     }
     const modules = this.moduleRows(learner.id);
-    const final = this.finalRow(learner.id);
     const allModulesPassed = MODULE_IDS.every((id) => modules.some((item) => item.module_id === id && item.best_score >= passingScore));
     const hasLessonPlan = this.parseLessonPlan(learner.lesson_plan_json) !== null;
-    if (!allModulesPassed || !final || final.best_score < passingScore || !hasLessonPlan || learner.active_seconds < requiredActiveSeconds) {
+    if (!allModulesPassed || !hasLessonPlan || learner.active_seconds < requiredActiveSeconds) {
       return { ok: false, error: "NOT_ELIGIBLE" };
     }
     const now = Date.now();
+    const assessmentScore = Math.round(
+      MODULE_IDS.reduce((sum, id) => sum + (modules.find((item) => item.module_id === id)?.best_score ?? 0), 0) / MODULE_IDS.length,
+    );
+    this.ctx.storage.sql.exec(
+      `INSERT INTO final_attempts (learner_id, best_score, attempts, last_submitted_at)
+       VALUES (?, ?, 1, ?)
+       ON CONFLICT(learner_id) DO UPDATE SET
+         best_score = excluded.best_score,
+         attempts = final_attempts.attempts + 1,
+         last_submitted_at = excluded.last_submitted_at`,
+      learner.id,
+      assessmentScore,
+      now,
+    );
     this.ctx.storage.sql.exec(
       `UPDATE learners
        SET completed_at = ?, certificate_code = ?, certificate_issued_at = ?, updated_at = ?
