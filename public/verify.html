@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071b2b">
+  <title>證書驗證｜媒體素養認證 3 小時</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/verify.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要內容</a>
+  <header class="site-header">
+    <a class="brand" href="/">媒體素養認證 3 小時</a>
+    <nav><a href="/">回到課程</a></nav>
+  </header>
+  <main id="main" class="verify-main">
+    <section class="page-heading">
+      <p class="eyebrow">公開查驗</p>
+      <h1>課程完成證書驗證</h1>
+      <p>輸入證書右下角的編號。公開結果不顯示 Email、分數或教案內容。</p>
+    </section>
+    <section class="panel narrow">
+      <form id="verify-form" class="stack-form">
+        <label for="certificate-code">證書編號</label>
+        <input id="certificate-code" name="code" autocomplete="off" placeholder="ML3-2026-⋯" required>
+        <button class="button primary" type="submit">驗證證書</button>
+      </form>
+      <div id="verify-result" aria-live="polite"></div>
+    </section>
+  </main>
+  <footer class="site-footer"><p>媒體素養認證 3 小時</p></footer>
+</body>
+</html>
