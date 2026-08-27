@@ -1,440 +1,101 @@
 import { DurableObject } from "cloudflare:workers";
 import { MODULE_IDS } from "./course-content";
 
-export type EnrollInput = {
-  id: string;
-  tokenHash: string;
-  name: string;
-  school: string;
-  email: string;
-  consentAt: number;
-};
+export const MODULE_REQUIRED_SECONDS = 25 * 60;
+export const CAPSTONE_REQUIRED_SECONDS = 30 * 60;
 
-export type LessonPlan = {
-  title: string;
-  audience: string;
-  objective: string;
-  activity: string;
-  assessment: string;
-};
-
-type LearnerRow = {
-  id: string;
-  name: string;
-  school: string;
-  email: string;
-  active_seconds: number;
-  last_heartbeat_at: number | null;
-  lesson_plan_json: string | null;
-  completed_at: number | null;
-  certificate_code: string | null;
-  certificate_issued_at: number | null;
-  created_at: number;
-  updated_at: number;
-};
-
-type ModuleRow = {
-  module_id: string;
-  best_score: number;
-  attempts: number;
-  completed_at: number | null;
-};
-
-type FinalRow = {
-  best_score: number;
-  attempts: number;
-  last_submitted_at: number;
-};
-
-type CompletionRow = {
-  id: string;
-  name: string;
-  school: string;
-  email: string;
-  active_seconds: number;
-  final_score: number;
-  completed_at: number;
-  certificate_code: string;
-  lesson_plan_json: string;
-};
+export type EnrollInput = { id: string; tokenHash: string; sessionHash?: string; recoveryHash?: string; name: string; school: string; email: string; consentAt: number };
+export type LessonPlan = { title: string; audience: string; objective: string; activity: string; assessment: string; sourceChecked?: boolean; studentOutput?: boolean; privacyChecked?: boolean };
+export type ModuleEvidence = { subject:string; observation:string; judgement:string; limitation:string };
+export function lessonPlanIssues(p:LessonPlan|null):string[]{if(!p)return["尚未儲存微教案"];const issues:string[]=[];const combined=`${p.objective} ${p.activity} ${p.assessment}`;if(p.title.length<6)issues.push("活動名稱至少 6 字");if(p.objective.length<30||!/(學生|學習者)/.test(p.objective)||!/(完成|產出|標示|比較|說明|查核|辨認|分析)/.test(p.objective))issues.push("目標須包含學生可觀察的學習表現");if(p.activity.length<120||!/[0-9一二三四五六七八九十]+\s*(分|分鐘)/.test(p.activity))issues.push("活動流程須至少 120 字並標出分鐘配置");if(p.assessment.length<40||!/(完成|產出|標示|比較|說明|查核|辨認|分析)/.test(combined))issues.push("評量須說明可觀察的學生產出或判準");if(!p.sourceChecked)issues.push("尚未確認素材來源與使用權");if(!p.studentOutput)issues.push("尚未確認學生產出");if(!p.privacyChecked)issues.push("尚未確認個資與傷害風險");return issues;}
+export function evidenceIssues(value:string|ModuleEvidence|null):string[]{let e:unknown=value;if(typeof value==="string")try{e=JSON.parse(value)}catch{return["實作證據格式錯誤"]}if(!e||typeof e!=="object"||Array.isArray(e))return["實作證據格式錯誤"];const r=e as Record<string,unknown>,rules:[[keyof ModuleEvidence,number,string],[keyof ModuleEvidence,number,string],[keyof ModuleEvidence,number,string],[keyof ModuleEvidence,number,string]]=[["subject",10,"查核對象至少 10 字"],["observation",30,"觀察紀錄至少 30 字"],["judgement",30,"判斷與證據至少 30 字"],["limitation",20,"限制與下一步至少 20 字"]],issues:string[]=[];for(const[k,min,message]of rules){if(typeof r[k]!=="string"||r[k].trim().length<min)issues.push(message)}const text=rules.map(([k])=>typeof r[k]==="string"?r[k]:"").join(" ");if(new Set(text.replace(/\s/g,"")).size<20||/(.)\1{9,}/u.test(text))issues.push("內容需具體且不可重複灌字");return issues;}
+type LearnerRow = { id:string; name:string; school:string; email:string; active_seconds:number; last_heartbeat_at:number|null; lesson_plan_json:string|null; completed_at:number|null; certificate_code:string|null; certificate_issued_at:number|null; created_at:number; updated_at:number };
+type ModuleRow = { module_id:string; best_score:number; attempts:number; completed_at:number|null; active_seconds:number };
+type EvidenceRow = { module_id:string; response:string; submitted_at:number };
+type FinalRow = { best_score:number; attempts:number; last_submitted_at:number };
+type CompletionRow = { id:string; name:string; school:string; email:string; active_seconds:number; final_score:number; completed_at:number; certificate_code:string; lesson_plan_json:string };
 
 export class CertificationStore extends DurableObject<Env> {
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    ctx.blockConcurrencyWhile(async () => {
-      this.migrate();
-    });
+  constructor(ctx: DurableObjectState, env: Env) { super(ctx, env); ctx.blockConcurrencyWhile(async () => this.migrate()); }
+
+  private async migrate(): Promise<void> {
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS _sql_schema_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+    const version=this.ctx.storage.sql.exec<{version:number}>("SELECT COALESCE(MAX(id),0) version FROM _sql_schema_migrations").one().version;
+    if(version<1)this.ctx.storage.sql.exec(`
+      CREATE TABLE learners (id TEXT PRIMARY KEY,token_hash TEXT NOT NULL UNIQUE,name TEXT NOT NULL,school TEXT NOT NULL,email TEXT NOT NULL COLLATE NOCASE UNIQUE,consent_at INTEGER NOT NULL,active_seconds INTEGER NOT NULL DEFAULT 0,last_heartbeat_at INTEGER,lesson_plan_json TEXT,completed_at INTEGER,certificate_code TEXT UNIQUE,certificate_issued_at INTEGER,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+      CREATE TABLE module_progress (learner_id TEXT NOT NULL,module_id TEXT NOT NULL,best_score INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,completed_at INTEGER,last_submitted_at INTEGER NOT NULL,PRIMARY KEY(learner_id,module_id),FOREIGN KEY(learner_id) REFERENCES learners(id) ON DELETE CASCADE);
+      CREATE TABLE final_attempts (learner_id TEXT PRIMARY KEY,best_score INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,last_submitted_at INTEGER NOT NULL,FOREIGN KEY(learner_id) REFERENCES learners(id) ON DELETE CASCADE);
+      CREATE TABLE admin_login_limits (login_key TEXT PRIMARY KEY,window_started_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
+      CREATE INDEX idx_learners_completed_at ON learners(completed_at DESC); CREATE INDEX idx_learners_certificate_code ON learners(certificate_code); CREATE INDEX idx_learners_school ON learners(school);
+      INSERT INTO _sql_schema_migrations(id,applied_at) VALUES(1,unixepoch());`);
+    if(version<2)this.ctx.storage.sql.exec(`
+      CREATE TABLE learner_sessions(session_hash TEXT PRIMARY KEY,learner_id TEXT NOT NULL,expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL,revoked_at INTEGER,FOREIGN KEY(learner_id) REFERENCES learners(id) ON DELETE CASCADE);
+      CREATE TABLE learner_recovery(learner_id TEXT PRIMARY KEY,recovery_hash TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL,used_at INTEGER,FOREIGN KEY(learner_id) REFERENCES learners(id) ON DELETE CASCADE);
+      CREATE TABLE module_activity(learner_id TEXT NOT NULL,module_id TEXT NOT NULL,active_seconds INTEGER NOT NULL DEFAULT 0,last_heartbeat_at INTEGER,PRIMARY KEY(learner_id,module_id),FOREIGN KEY(learner_id) REFERENCES learners(id) ON DELETE CASCADE);
+      CREATE TABLE module_evidence(learner_id TEXT NOT NULL,module_id TEXT NOT NULL,response TEXT NOT NULL,submitted_at INTEGER NOT NULL,PRIMARY KEY(learner_id,module_id),FOREIGN KEY(learner_id) REFERENCES learners(id) ON DELETE CASCADE);
+      CREATE TABLE admin_sessions(session_hash TEXT PRIMARY KEY,username TEXT NOT NULL,expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL,revoked_at INTEGER);
+      CREATE TABLE admin_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL,action TEXT NOT NULL,detail TEXT NOT NULL,ip_hash TEXT NOT NULL,created_at INTEGER NOT NULL);
+      CREATE TABLE enroll_limits(ip_hash TEXT PRIMARY KEY,window_started_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
+      CREATE INDEX idx_learner_sessions_learner ON learner_sessions(learner_id); CREATE INDEX idx_admin_audit_created ON admin_audit(created_at DESC);
+      INSERT INTO _sql_schema_migrations(id,applied_at) VALUES(2,unixepoch());`);
+    if(version<3)this.ctx.storage.sql.exec(`
+      CREATE TABLE admin_totp_usage(username TEXT PRIMARY KEY,last_step INTEGER NOT NULL,used_at INTEGER NOT NULL);
+      INSERT INTO _sql_schema_migrations(id,applied_at) VALUES(3,unixepoch());`);
+    this.ctx.storage.sql.exec("PRAGMA optimize");
+    if(await this.ctx.storage.getAlarm()===null)await this.ctx.storage.setAlarm(Date.now()+24*60*60*1000);
   }
 
-  private migrate(): void {
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS _sql_schema_migrations (
-        id INTEGER PRIMARY KEY,
-        applied_at INTEGER NOT NULL
-      );
-    `);
-    const version = this.ctx.storage.sql
-      .exec<{ version: number }>("SELECT COALESCE(MAX(id), 0) AS version FROM _sql_schema_migrations")
-      .one().version;
+  override async alarm(){await this.purgeExpired(Date.now());await this.ctx.storage.setAlarm(Date.now()+24*60*60*1000);}
+  async purgeExpired(now:number){const learnerCutoff=now-3*365*24*60*60*1000,auditCutoff=learnerCutoff;const expired=this.ctx.storage.sql.exec<{count:number}>("SELECT COUNT(*) count FROM learners WHERE COALESCE(completed_at,updated_at)<?",learnerCutoff).one().count;this.ctx.storage.sql.exec("DELETE FROM learners WHERE COALESCE(completed_at,updated_at)<?",learnerCutoff);this.ctx.storage.sql.exec("DELETE FROM learner_sessions WHERE expires_at<? OR (revoked_at IS NOT NULL AND revoked_at<?)",now,now-30*86400000);this.ctx.storage.sql.exec("DELETE FROM admin_sessions WHERE expires_at<? OR (revoked_at IS NOT NULL AND revoked_at<?)",now,now-7*86400000);this.ctx.storage.sql.exec("DELETE FROM admin_audit WHERE created_at<?",auditCutoff);this.ctx.storage.sql.exec("DELETE FROM enroll_limits WHERE window_started_at<?",now-3600000);this.ctx.storage.sql.exec("DELETE FROM admin_login_limits WHERE window_started_at<?",now-900000);return expired;}
+  async canEnroll(ipHash:string,now:number){const r=this.ctx.storage.sql.exec<{window_started_at:number;attempts:number}>("SELECT window_started_at,attempts FROM enroll_limits WHERE ip_hash=?",ipHash).toArray()[0];return !r||now-r.window_started_at>=3600000||r.attempts<100;}
+  async recordEnrollAttempt(ipHash:string,now:number){this.ctx.storage.sql.exec(`INSERT INTO enroll_limits(ip_hash,window_started_at,attempts) VALUES(?,?,1) ON CONFLICT(ip_hash) DO UPDATE SET window_started_at=CASE WHEN ?-window_started_at>=3600000 THEN ? ELSE window_started_at END,attempts=CASE WHEN ?-window_started_at>=3600000 THEN 1 ELSE attempts+1 END`,ipHash,now,now,now,now);}
+  async enroll(i:EnrollInput):Promise<{ok:true}|{ok:false;error:"EMAIL_EXISTS"}>{const now=Date.now();if(this.ctx.storage.sql.exec<{count:number}>("SELECT COUNT(*) count FROM learners WHERE email=? COLLATE NOCASE",i.email).one().count)return{ok:false,error:"EMAIL_EXISTS"};this.ctx.storage.sql.exec("INSERT INTO learners(id,token_hash,name,school,email,consent_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",i.id,i.tokenHash,i.name,i.school,i.email,i.consentAt,now,now);if(i.sessionHash)this.createLearnerSessionRow(i.id,i.sessionHash,now);if(i.recoveryHash)this.ctx.storage.sql.exec("INSERT INTO learner_recovery(learner_id,recovery_hash,created_at) VALUES(?,?,?)",i.id,i.recoveryHash,now);return{ok:true};}
 
-    if (version < 1) {
-      this.ctx.storage.sql.exec(`
-        CREATE TABLE learners (
-          id TEXT PRIMARY KEY,
-          token_hash TEXT NOT NULL UNIQUE,
-          name TEXT NOT NULL,
-          school TEXT NOT NULL,
-          email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-          consent_at INTEGER NOT NULL,
-          active_seconds INTEGER NOT NULL DEFAULT 0,
-          last_heartbeat_at INTEGER,
-          lesson_plan_json TEXT,
-          completed_at INTEGER,
-          certificate_code TEXT UNIQUE,
-          certificate_issued_at INTEGER,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL
-        );
+  async getLearner(hash:string){const l=this.findLearnerByLegacy(hash);return l?this.snapshot(l):null;}
+  async getLearnerBySession(hash:string,now=Date.now()){const l=this.findLearnerBySession(hash,now);return l?this.snapshot(l):null;}
+  async createSessionFromLegacy(tokenHash:string,sessionHash:string,recoveryHash?:string){const l=this.findLearnerByLegacy(tokenHash);if(!l)return false;const now=Date.now();this.ctx.storage.sql.exec("UPDATE learners SET token_hash=?,updated_at=? WHERE id=?",`consumed:${l.id}:${now}`,now,l.id);this.createLearnerSessionRow(l.id,sessionHash,now);if(recoveryHash)this.ctx.storage.sql.exec(`INSERT INTO learner_recovery(learner_id,recovery_hash,created_at) VALUES(?,?,?) ON CONFLICT(learner_id) DO UPDATE SET recovery_hash=excluded.recovery_hash,created_at=excluded.created_at`,l.id,recoveryHash,now);return true;}
+  async recover(oldHash:string,newHash:string,sessionHash:string){const r=this.ctx.storage.sql.exec<{learner_id:string}>("SELECT learner_id FROM learner_recovery WHERE recovery_hash=?",oldHash).toArray()[0];if(!r)return false;const now=Date.now();this.ctx.storage.sql.exec("UPDATE learner_recovery SET recovery_hash=?,created_at=? WHERE learner_id=?",newHash,now,r.learner_id);this.ctx.storage.sql.exec("UPDATE learner_sessions SET revoked_at=? WHERE learner_id=? AND revoked_at IS NULL",now,r.learner_id);this.createLearnerSessionRow(r.learner_id,sessionHash,now);return true;}
+  async revokeLearnerSession(hash:string){this.ctx.storage.sql.exec("UPDATE learner_sessions SET revoked_at=? WHERE session_hash=?",Date.now(),hash);}
+  async deleteLearner(hash:string){const l=this.findLearnerBySession(hash,Date.now());if(!l)return false;this.ctx.storage.sql.exec("DELETE FROM learners WHERE id=?",l.id);return true;}
 
-        CREATE TABLE module_progress (
-          learner_id TEXT NOT NULL,
-          module_id TEXT NOT NULL,
-          best_score INTEGER NOT NULL DEFAULT 0,
-          attempts INTEGER NOT NULL DEFAULT 0,
-          completed_at INTEGER,
-          last_submitted_at INTEGER NOT NULL,
-          PRIMARY KEY (learner_id, module_id),
-          FOREIGN KEY (learner_id) REFERENCES learners(id) ON DELETE CASCADE
-        );
+  async heartbeatBySession(hash:string,now:number,context:string){return this.heartbeatFor(this.requireSession(hash,now),now,context);}
+  async heartbeat(hash:string,now:number,context:string){const l=this.findLearnerByLegacy(hash);if(!l)throw new Error("UNAUTHORIZED");return this.heartbeatFor(l,now,context);}
+  private heartbeatFor(l:LearnerRow,now:number,context:string){if(![...MODULE_IDS,"capstone"].includes(context))throw new Error("INVALID_MODULE");const r=this.ctx.storage.sql.exec<{active_seconds:number;last_heartbeat_at:number|null}>("SELECT active_seconds,last_heartbeat_at FROM module_activity WHERE learner_id=? AND module_id=?",l.id,context).toArray()[0];let gained=0;if(r?.last_heartbeat_at!=null){const elapsed=Math.floor((now-r.last_heartbeat_at)/1000);if(elapsed>=20&&elapsed<=90)gained=elapsed;}const contextSeconds=(r?.active_seconds??0)+gained;this.ctx.storage.sql.exec(`INSERT INTO module_activity(learner_id,module_id,active_seconds,last_heartbeat_at) VALUES(?,?,?,?) ON CONFLICT(learner_id,module_id) DO UPDATE SET active_seconds=excluded.active_seconds,last_heartbeat_at=excluded.last_heartbeat_at`,l.id,context,contextSeconds,now);const activeSeconds=l.active_seconds+gained;this.ctx.storage.sql.exec("UPDATE learners SET active_seconds=?,last_heartbeat_at=?,updated_at=? WHERE id=?",activeSeconds,now,now,l.id);return{activeSeconds,contextSeconds};}
 
-        CREATE TABLE final_attempts (
-          learner_id TEXT PRIMARY KEY,
-          best_score INTEGER NOT NULL DEFAULT 0,
-          attempts INTEGER NOT NULL DEFAULT 0,
-          last_submitted_at INTEGER NOT NULL,
-          FOREIGN KEY (learner_id) REFERENCES learners(id) ON DELETE CASCADE
-        );
+  async recordModuleScoreBySession(hash:string,id:string,score:number,pass:number){this.recordModuleScoreFor(this.requireSession(hash),id,score,pass);}
+  async recordModuleScore(hash:string,id:string,score:number,pass:number){const l=this.findLearnerByLegacy(hash);if(!l)throw new Error("UNAUTHORIZED");this.recordModuleScoreFor(l,id,score,pass);}
+  private recordModuleScoreFor(l:LearnerRow,id:string,score:number,pass:number){if(!MODULE_IDS.includes(id))throw new Error("INVALID_MODULE");const now=Date.now();this.ctx.storage.sql.exec(`INSERT INTO module_progress(learner_id,module_id,best_score,attempts,completed_at,last_submitted_at) VALUES(?,?,?,1,?,?) ON CONFLICT(learner_id,module_id) DO UPDATE SET best_score=MAX(best_score,excluded.best_score),attempts=attempts+1,completed_at=CASE WHEN completed_at IS NOT NULL THEN completed_at WHEN excluded.best_score>=? THEN excluded.last_submitted_at ELSE NULL END,last_submitted_at=excluded.last_submitted_at`,l.id,id,score,score>=pass?now:null,now,pass);}
+  async saveEvidence(hash:string,id:string,response:string){if(!MODULE_IDS.includes(id))throw new Error("INVALID_MODULE");if(evidenceIssues(response).length)throw new Error("VALIDATION");const l=this.requireSession(hash),now=Date.now();this.ctx.storage.sql.exec(`INSERT INTO module_evidence(learner_id,module_id,response,submitted_at) VALUES(?,?,?,?) ON CONFLICT(learner_id,module_id) DO UPDATE SET response=excluded.response,submitted_at=excluded.submitted_at`,l.id,id,response,now);}
+  async saveLessonPlanBySession(hash:string,p:LessonPlan){this.savePlan(this.requireSession(hash),p);}
+  async saveLessonPlan(hash:string,p:LessonPlan){const l=this.findLearnerByLegacy(hash);if(!l)throw new Error("UNAUTHORIZED");this.savePlan(l,p);}
+  private savePlan(l:LearnerRow,p:LessonPlan){this.ctx.storage.sql.exec("UPDATE learners SET lesson_plan_json=?,updated_at=? WHERE id=?",JSON.stringify(p),Date.now(),l.id);}
 
-        CREATE TABLE admin_login_limits (
-          login_key TEXT PRIMARY KEY,
-          window_started_at INTEGER NOT NULL,
-          attempts INTEGER NOT NULL DEFAULT 0
-        );
+  async issueCertificateBySession(hash:string,code:string,pass:number){return this.issue(this.requireSession(hash),code,pass);}
+  async issueCertificate(hash:string,code:string,_required:number,pass:number){const l=this.findLearnerByLegacy(hash);if(!l)throw new Error("UNAUTHORIZED");return this.issue(l,code,pass);}
+  private issue(l:LearnerRow,code:string,pass:number):{ok:true;code:string;completedAt:number}|{ok:false;error:"NOT_ELIGIBLE"}{if(l.certificate_code&&l.completed_at)return{ok:true,code:l.certificate_code,completedAt:l.completed_at};const modules=this.moduleRows(l.id),evidence=this.evidenceRows(l.id),plan=this.parsePlan(l.lesson_plan_json);const allPassed=MODULE_IDS.every(id=>{const m=modules.find(x=>x.module_id===id);return !!m&&m.best_score>=pass&&m.active_seconds>=MODULE_REQUIRED_SECONDS});const allEvidence=MODULE_IDS.every(id=>{const row=evidence.find(x=>x.module_id===id);return !!row&&evidenceIssues(row.response).length===0});if(!allPassed||!allEvidence||!this.validPlan(plan)||this.activitySeconds(l.id,"capstone")<CAPSTONE_REQUIRED_SECONDS)return{ok:false,error:"NOT_ELIGIBLE"};const now=Date.now(),average=Math.round(MODULE_IDS.reduce((s,id)=>s+(modules.find(x=>x.module_id===id)?.best_score??0),0)/6);this.ctx.storage.sql.exec(`INSERT INTO final_attempts(learner_id,best_score,attempts,last_submitted_at) VALUES(?,?,1,?) ON CONFLICT(learner_id) DO UPDATE SET best_score=excluded.best_score,attempts=attempts+1,last_submitted_at=excluded.last_submitted_at`,l.id,average,now);this.ctx.storage.sql.exec("UPDATE learners SET completed_at=?,certificate_code=?,certificate_issued_at=?,updated_at=? WHERE id=?",now,code,now,now,l.id);return{ok:true,code,completedAt:now};}
+  async verifyCertificate(code:string){const r=this.ctx.storage.sql.exec<{name:string;school:string;completed_at:number}>("SELECT name,school,completed_at FROM learners WHERE certificate_code=? AND completed_at IS NOT NULL",code).toArray()[0];return r?{valid:true,maskedName:this.maskName(r.name),school:r.school,completedAt:r.completed_at}:{valid:false};}
 
-        CREATE INDEX idx_learners_completed_at ON learners(completed_at DESC);
-        CREATE INDEX idx_learners_certificate_code ON learners(certificate_code);
-        CREATE INDEX idx_learners_school ON learners(school);
-        INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (1, unixepoch());
-        PRAGMA optimize;
-      `);
-    }
-  }
+  async adminStats(){const r=this.ctx.storage.sql.exec<{enrolled:number;completed:number;average_score:number|null;active_seconds:number}>(`SELECT COUNT(*) enrolled,SUM(CASE WHEN l.completed_at IS NOT NULL THEN 1 ELSE 0 END) completed,AVG(CASE WHEN l.completed_at IS NOT NULL THEN f.best_score END) average_score,SUM(l.active_seconds) active_seconds FROM learners l LEFT JOIN final_attempts f ON f.learner_id=l.id`).one();return{enrolled:r.enrolled,completed:r.completed??0,averageFinalScore:Math.round(r.average_score??0),totalActiveHours:Math.round((r.active_seconds/3600)*10)/10};}
+  async listCompletions(search:string,limit:number,offset:number):Promise<{rows:CompletionRow[];total:number}>{const safeLimit=Math.min(Math.max(limit,1),200),safeOffset=Math.max(offset,0),pattern=`%${search.replace(/[\\%_]/g,"\\$&")}%`,where=search?"completed_at IS NOT NULL AND (name LIKE ? ESCAPE '\\' OR school LIKE ? ESCAPE '\\' OR email LIKE ? ESCAPE '\\' OR certificate_code LIKE ? ESCAPE '\\')":"completed_at IS NOT NULL",params=search?[pattern,pattern,pattern,pattern]:[],total=this.ctx.storage.sql.exec<{count:number}>(`SELECT COUNT(*) count FROM learners WHERE ${where}`,...params).one().count,rows=this.ctx.storage.sql.exec<CompletionRow>(`SELECT l.id,l.name,l.school,l.email,l.active_seconds,f.best_score final_score,l.completed_at,l.certificate_code,l.lesson_plan_json FROM learners l JOIN final_attempts f ON f.learner_id=l.id WHERE ${where.replaceAll("completed_at","l.completed_at")} ORDER BY l.completed_at DESC LIMIT ? OFFSET ?`,...params,safeLimit,safeOffset).toArray();return{rows,total};}
 
-  async enroll(input: EnrollInput): Promise<{ ok: true } | { ok: false; error: "EMAIL_EXISTS" }> {
-    const now = Date.now();
-    const existing = this.ctx.storage.sql
-      .exec<{ count: number }>("SELECT COUNT(*) AS count FROM learners WHERE email = ? COLLATE NOCASE", input.email)
-      .one().count;
-    if (existing > 0) return { ok: false, error: "EMAIL_EXISTS" };
-    this.ctx.storage.sql.exec(
-      `INSERT INTO learners
-       (id, token_hash, name, school, email, consent_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      input.id,
-      input.tokenHash,
-      input.name,
-      input.school,
-      input.email,
-      input.consentAt,
-      now,
-      now,
-    );
-    return { ok: true };
-  }
+  async canAttemptAdminLogin(key:string,now:number){const r=this.ctx.storage.sql.exec<{window_started_at:number;attempts:number}>("SELECT window_started_at,attempts FROM admin_login_limits WHERE login_key=?",key).toArray()[0];return !r||now-r.window_started_at>=900000||r.attempts<5;}
+  async recordAdminLogin(key:string,success:boolean,now:number){if(success){this.ctx.storage.sql.exec("DELETE FROM admin_login_limits WHERE login_key=?",key);return;}this.ctx.storage.sql.exec(`INSERT INTO admin_login_limits(login_key,window_started_at,attempts) VALUES(?,?,1) ON CONFLICT(login_key) DO UPDATE SET window_started_at=CASE WHEN ?-window_started_at>=900000 THEN ? ELSE window_started_at END,attempts=CASE WHEN ?-window_started_at>=900000 THEN 1 ELSE attempts+1 END`,key,now,now,now,now);}
+  async createAdminSession(hash:string,username:string,expiresAt:number){this.ctx.storage.sql.exec("INSERT INTO admin_sessions(session_hash,username,expires_at,created_at) VALUES(?,?,?,?)",hash,username,expiresAt,Date.now());}
+  async validAdminSession(hash:string,now=Date.now()){return this.ctx.storage.sql.exec<{username:string}>("SELECT username FROM admin_sessions WHERE session_hash=? AND revoked_at IS NULL AND expires_at>?",hash,now).toArray()[0]?.username??null;}
+  async useAdminTotp(username:string,step:number,now=Date.now()){const row=this.ctx.storage.sql.exec<{last_step:number}>("SELECT last_step FROM admin_totp_usage WHERE username=?",username).toArray()[0];if(row&&step<=row.last_step)return false;this.ctx.storage.sql.exec(`INSERT INTO admin_totp_usage(username,last_step,used_at) VALUES(?,?,?) ON CONFLICT(username) DO UPDATE SET last_step=excluded.last_step,used_at=excluded.used_at`,username,step,now);return true;}
+  async revokeAdminSession(hash:string){this.ctx.storage.sql.exec("UPDATE admin_sessions SET revoked_at=? WHERE session_hash=?",Date.now(),hash);}
+  async audit(username:string,action:string,detail:string,ipHash:string){this.ctx.storage.sql.exec("INSERT INTO admin_audit(username,action,detail,ip_hash,created_at) VALUES(?,?,?,?,?)",username,action,detail,ipHash,Date.now());}
 
-  async getLearner(tokenHash: string): Promise<ReturnType<CertificationStore["snapshot"]> | null> {
-    const learner = this.findLearner(tokenHash);
-    return learner ? this.snapshot(learner) : null;
-  }
-
-  async heartbeat(tokenHash: string, now: number, moduleId: string): Promise<{ activeSeconds: number }> {
-    if (!MODULE_IDS.includes(moduleId)) throw new Error("INVALID_MODULE");
-    const learner = this.findLearner(tokenHash);
-    if (!learner) throw new Error("UNAUTHORIZED");
-
-    let gained = 0;
-    if (learner.last_heartbeat_at !== null) {
-      const elapsed = Math.floor((now - learner.last_heartbeat_at) / 1000);
-      if (elapsed >= 20 && elapsed <= 90) gained = elapsed;
-    }
-    const activeSeconds = learner.active_seconds + gained;
-    this.ctx.storage.sql.exec(
-      "UPDATE learners SET active_seconds = ?, last_heartbeat_at = ?, updated_at = ? WHERE id = ?",
-      activeSeconds,
-      now,
-      now,
-      learner.id,
-    );
-    return { activeSeconds };
-  }
-
-  async recordModuleScore(tokenHash: string, moduleId: string, score: number, passingScore: number): Promise<void> {
-    if (!MODULE_IDS.includes(moduleId)) throw new Error("INVALID_MODULE");
-    const learner = this.findLearner(tokenHash);
-    if (!learner) throw new Error("UNAUTHORIZED");
-    const now = Date.now();
-    this.ctx.storage.sql.exec(
-      `INSERT INTO module_progress
-       (learner_id, module_id, best_score, attempts, completed_at, last_submitted_at)
-       VALUES (?, ?, ?, 1, ?, ?)
-       ON CONFLICT(learner_id, module_id) DO UPDATE SET
-         best_score = MAX(module_progress.best_score, excluded.best_score),
-         attempts = module_progress.attempts + 1,
-         completed_at = CASE
-           WHEN module_progress.completed_at IS NOT NULL THEN module_progress.completed_at
-           WHEN excluded.best_score >= ? THEN excluded.last_submitted_at
-           ELSE NULL
-         END,
-         last_submitted_at = excluded.last_submitted_at`,
-      learner.id,
-      moduleId,
-      score,
-      score >= passingScore ? now : null,
-      now,
-      passingScore,
-    );
-    this.ctx.storage.sql.exec("UPDATE learners SET updated_at = ? WHERE id = ?", now, learner.id);
-  }
-
-  async saveLessonPlan(tokenHash: string, plan: LessonPlan): Promise<void> {
-    const learner = this.findLearner(tokenHash);
-    if (!learner) throw new Error("UNAUTHORIZED");
-    const now = Date.now();
-    this.ctx.storage.sql.exec(
-      "UPDATE learners SET lesson_plan_json = ?, updated_at = ? WHERE id = ?",
-      JSON.stringify(plan),
-      now,
-      learner.id,
-    );
-  }
-
-  async issueCertificate(
-    tokenHash: string,
-    code: string,
-    requiredActiveSeconds: number,
-    passingScore: number,
-  ): Promise<{ ok: true; code: string; completedAt: number } | { ok: false; error: "NOT_ELIGIBLE" }> {
-    const learner = this.findLearner(tokenHash);
-    if (!learner) throw new Error("UNAUTHORIZED");
-    if (learner.certificate_code && learner.completed_at) {
-      return { ok: true, code: learner.certificate_code, completedAt: learner.completed_at };
-    }
-    const modules = this.moduleRows(learner.id);
-    const allModulesPassed = MODULE_IDS.every((id) => modules.some((item) => item.module_id === id && item.best_score >= passingScore));
-    const hasLessonPlan = this.parseLessonPlan(learner.lesson_plan_json) !== null;
-    if (!allModulesPassed || !hasLessonPlan || learner.active_seconds < requiredActiveSeconds) {
-      return { ok: false, error: "NOT_ELIGIBLE" };
-    }
-    const now = Date.now();
-    const assessmentScore = Math.round(
-      MODULE_IDS.reduce((sum, id) => sum + (modules.find((item) => item.module_id === id)?.best_score ?? 0), 0) / MODULE_IDS.length,
-    );
-    this.ctx.storage.sql.exec(
-      `INSERT INTO final_attempts (learner_id, best_score, attempts, last_submitted_at)
-       VALUES (?, ?, 1, ?)
-       ON CONFLICT(learner_id) DO UPDATE SET
-         best_score = excluded.best_score,
-         attempts = final_attempts.attempts + 1,
-         last_submitted_at = excluded.last_submitted_at`,
-      learner.id,
-      assessmentScore,
-      now,
-    );
-    this.ctx.storage.sql.exec(
-      `UPDATE learners
-       SET completed_at = ?, certificate_code = ?, certificate_issued_at = ?, updated_at = ?
-       WHERE id = ?`,
-      now,
-      code,
-      now,
-      now,
-      learner.id,
-    );
-    return { ok: true, code, completedAt: now };
-  }
-
-  async verifyCertificate(code: string): Promise<{
-    valid: boolean;
-    maskedName?: string;
-    school?: string;
-    completedAt?: number;
-  }> {
-    const row = this.ctx.storage.sql
-      .exec<{ name: string; school: string; completed_at: number }>(
-        "SELECT name, school, completed_at FROM learners WHERE certificate_code = ? AND completed_at IS NOT NULL",
-        code,
-      )
-      .toArray()[0];
-    if (!row) return { valid: false };
-    return { valid: true, maskedName: this.maskName(row.name), school: row.school, completedAt: row.completed_at };
-  }
-
-  async adminStats(): Promise<{
-    enrolled: number;
-    completed: number;
-    averageFinalScore: number;
-    totalActiveHours: number;
-  }> {
-    const row = this.ctx.storage.sql.exec<{
-      enrolled: number;
-      completed: number;
-      average_score: number | null;
-      active_seconds: number;
-    }>(`
-      SELECT
-        COUNT(*) AS enrolled,
-        SUM(CASE WHEN l.completed_at IS NOT NULL THEN 1 ELSE 0 END) AS completed,
-        AVG(CASE WHEN l.completed_at IS NOT NULL THEN f.best_score END) AS average_score,
-        SUM(l.active_seconds) AS active_seconds
-      FROM learners l
-      LEFT JOIN final_attempts f ON f.learner_id = l.id
-    `).one();
-    return {
-      enrolled: row.enrolled,
-      completed: row.completed ?? 0,
-      averageFinalScore: Math.round(row.average_score ?? 0),
-      totalActiveHours: Math.round((row.active_seconds / 3600) * 10) / 10,
-    };
-  }
-
-  async listCompletions(search: string, limit: number, offset: number): Promise<{ rows: CompletionRow[]; total: number }> {
-    const safeLimit = Math.min(Math.max(limit, 1), 200);
-    const safeOffset = Math.max(offset, 0);
-    const pattern = `%${search.replace(/[\\%_]/g, "\\$&")}%`;
-    const where = search
-      ? "completed_at IS NOT NULL AND (name LIKE ? ESCAPE '\\' OR school LIKE ? ESCAPE '\\' OR email LIKE ? ESCAPE '\\' OR certificate_code LIKE ? ESCAPE '\\')"
-      : "completed_at IS NOT NULL";
-    const params = search ? [pattern, pattern, pattern, pattern] : [];
-    const total = this.ctx.storage.sql
-      .exec<{ count: number }>(`SELECT COUNT(*) AS count FROM learners WHERE ${where}`, ...params)
-      .one().count;
-    const rows = this.ctx.storage.sql.exec<CompletionRow>(
-      `SELECT
-         l.id, l.name, l.school, l.email, l.active_seconds,
-         f.best_score AS final_score, l.completed_at, l.certificate_code, l.lesson_plan_json
-       FROM learners l
-       JOIN final_attempts f ON f.learner_id = l.id
-       WHERE ${where.replaceAll("completed_at", "l.completed_at")}
-       ORDER BY l.completed_at DESC
-       LIMIT ? OFFSET ?`,
-      ...params,
-      safeLimit,
-      safeOffset,
-    ).toArray();
-    return { rows, total };
-  }
-
-  async canAttemptAdminLogin(loginKey: string, now: number): Promise<boolean> {
-    const row = this.ctx.storage.sql
-      .exec<{ window_started_at: number; attempts: number }>(
-        "SELECT window_started_at, attempts FROM admin_login_limits WHERE login_key = ?",
-        loginKey,
-      )
-      .toArray()[0];
-    if (!row || now - row.window_started_at >= 15 * 60 * 1000) return true;
-    return row.attempts < 5;
-  }
-
-  async recordAdminLogin(loginKey: string, success: boolean, now: number): Promise<void> {
-    if (success) {
-      this.ctx.storage.sql.exec("DELETE FROM admin_login_limits WHERE login_key = ?", loginKey);
-      return;
-    }
-    this.ctx.storage.sql.exec(
-      `INSERT INTO admin_login_limits (login_key, window_started_at, attempts)
-       VALUES (?, ?, 1)
-       ON CONFLICT(login_key) DO UPDATE SET
-         window_started_at = CASE
-           WHEN ? - admin_login_limits.window_started_at >= 900000 THEN ?
-           ELSE admin_login_limits.window_started_at
-         END,
-         attempts = CASE
-           WHEN ? - admin_login_limits.window_started_at >= 900000 THEN 1
-           ELSE admin_login_limits.attempts + 1
-         END`,
-      loginKey,
-      now,
-      now,
-      now,
-      now,
-    );
-  }
-
-  private findLearner(tokenHash: string): LearnerRow | null {
-    return this.ctx.storage.sql
-      .exec<LearnerRow>("SELECT * FROM learners WHERE token_hash = ?", tokenHash)
-      .toArray()[0] ?? null;
-  }
-
-  private moduleRows(learnerId: string): ModuleRow[] {
-    return this.ctx.storage.sql
-      .exec<ModuleRow>(
-        "SELECT module_id, best_score, attempts, completed_at FROM module_progress WHERE learner_id = ? ORDER BY module_id",
-        learnerId,
-      )
-      .toArray();
-  }
-
-  private finalRow(learnerId: string): FinalRow | null {
-    return this.ctx.storage.sql
-      .exec<FinalRow>(
-        "SELECT best_score, attempts, last_submitted_at FROM final_attempts WHERE learner_id = ?",
-        learnerId,
-      )
-      .toArray()[0] ?? null;
-  }
-
-  private snapshot(learner: LearnerRow) {
-    const modules = this.moduleRows(learner.id);
-    const final = this.finalRow(learner.id);
-    return {
-      id: learner.id,
-      name: learner.name,
-      school: learner.school,
-      email: learner.email,
-      activeSeconds: learner.active_seconds,
-      lessonPlan: this.parseLessonPlan(learner.lesson_plan_json),
-      completedAt: learner.completed_at,
-      certificateCode: learner.certificate_code,
-      certificateIssuedAt: learner.certificate_issued_at,
-      createdAt: learner.created_at,
-      updatedAt: learner.updated_at,
-      modules: Object.fromEntries(modules.map((item) => [item.module_id, {
-        bestScore: item.best_score,
-        attempts: item.attempts,
-        completedAt: item.completed_at,
-      }])),
-      final: final ? {
-        bestScore: final.best_score,
-        attempts: final.attempts,
-        lastSubmittedAt: final.last_submitted_at,
-      } : null,
-    };
-  }
-
-  private parseLessonPlan(value: string | null): LessonPlan | null {
-    if (!value) return null;
-    try {
-      return JSON.parse(value) as LessonPlan;
-    } catch {
-      return null;
-    }
-  }
-
-  private maskName(name: string): string {
-    const characters = [...name];
-    if (characters.length <= 1) return "＊";
-    if (characters.length === 2) return `${characters[0]}＊`;
-    return `${characters[0]}${"＊".repeat(characters.length - 2)}${characters.at(-1)}`;
-  }
+  private findLearnerByLegacy(hash:string){return this.ctx.storage.sql.exec<LearnerRow>("SELECT * FROM learners WHERE token_hash=?",hash).toArray()[0]??null;}
+  private findLearnerBySession(hash:string,now:number){return this.ctx.storage.sql.exec<LearnerRow>("SELECT l.* FROM learners l JOIN learner_sessions s ON s.learner_id=l.id WHERE s.session_hash=? AND s.revoked_at IS NULL AND s.expires_at>?",hash,now).toArray()[0]??null;}
+  private requireSession(hash:string,now=Date.now()){const l=this.findLearnerBySession(hash,now);if(!l)throw new Error("UNAUTHORIZED");return l;}
+  private createLearnerSessionRow(id:string,hash:string,now:number){this.ctx.storage.sql.exec("INSERT INTO learner_sessions(session_hash,learner_id,expires_at,created_at) VALUES(?,?,?,?)",hash,id,now+30*86400000,now);}
+  private moduleRows(id:string):ModuleRow[]{return this.ctx.storage.sql.exec<ModuleRow>("SELECT p.module_id,p.best_score,p.attempts,p.completed_at,COALESCE(a.active_seconds,0) active_seconds FROM module_progress p LEFT JOIN module_activity a ON a.learner_id=p.learner_id AND a.module_id=p.module_id WHERE p.learner_id=?",id).toArray();}
+  private evidenceRows(id:string){return this.ctx.storage.sql.exec<EvidenceRow>("SELECT module_id,response,submitted_at FROM module_evidence WHERE learner_id=?",id).toArray();}
+  private activitySeconds(id:string,module:string){return this.ctx.storage.sql.exec<{active_seconds:number}>("SELECT active_seconds FROM module_activity WHERE learner_id=? AND module_id=?",id,module).toArray()[0]?.active_seconds??0;}
+  private finalRow(id:string){return this.ctx.storage.sql.exec<FinalRow>("SELECT best_score,attempts,last_submitted_at FROM final_attempts WHERE learner_id=?",id).toArray()[0]??null;}
+  private snapshot(l:LearnerRow){const modules=this.moduleRows(l.id),evidence=this.evidenceRows(l.id),final=this.finalRow(l.id),plan=this.parsePlan(l.lesson_plan_json);return{id:l.id,name:l.name,school:l.school,email:l.email,activeSeconds:l.active_seconds,capstoneActiveSeconds:this.activitySeconds(l.id,"capstone"),lessonPlan:plan,lessonPlanQualified:lessonPlanIssues(plan).length===0,completedAt:l.completed_at,certificateCode:l.certificate_code,certificateIssuedAt:l.certificate_issued_at,createdAt:l.created_at,updatedAt:l.updated_at,modules:Object.fromEntries(MODULE_IDS.map(id=>{const m=modules.find(x=>x.module_id===id),raw=evidence.find(x=>x.module_id===id)?.response??null;let parsed:string|Record<string,string>|null=raw;if(raw)try{parsed=JSON.parse(raw) as Record<string,string>}catch{}return[id,{bestScore:m?.best_score??0,attempts:m?.attempts??0,completedAt:m?.completed_at??null,activeSeconds:m?.active_seconds??this.activitySeconds(l.id,id),evidence:parsed}]})),final:final?{bestScore:final.best_score,attempts:final.attempts,lastSubmittedAt:final.last_submitted_at}:null};}
+  private parsePlan(value:string|null):LessonPlan|null{if(!value)return null;try{return JSON.parse(value) as LessonPlan}catch{return null}}
+  private validPlan(p:LessonPlan|null){return lessonPlanIssues(p).length===0;}
+  private maskName(name:string){const c=[...name];if(c.length<=1)return"＊";if(c.length===2)return`${c[0]}＊`;return`${c[0]}${"＊".repeat(c.length-2)}${c.at(-1)}`;}
 }

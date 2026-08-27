@@ -1,2 +1,4 @@
 ADMIN_PASSWORD=replace-with-a-long-random-password
+ADMIN_USERNAME=replace-with-a-named-admin-account
+ADMIN_TOTP_SECRET=replace-with-a-base32-totp-secret
 SESSION_SECRET=replace-with-at-least-32-random-bytes

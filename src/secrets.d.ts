@@ -3,6 +3,8 @@
 declare global {
   interface Env {
     ADMIN_PASSWORD: string;
+    ADMIN_USERNAME: string;
+    ADMIN_TOTP_SECRET: string;
     SESSION_SECRET: string;
   }
 }

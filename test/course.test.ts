@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { COURSE_MODULES, PASSING_SCORE, QUESTIONS, grade, publicCourse } from "../src/course";
+import { referenceFor, REGISTERED_SOURCE_REFS } from "../src/source-registry";
 
 describe("課程題庫", () => {
   it("公開課程不洩漏答案與解析", () => {
@@ -24,9 +25,36 @@ describe("課程題庫", () => {
       expect(question.options).toHaveLength(4);
       expect(new Set(question.options).size).toBe(4);
       expect(question.explanation.length).toBeGreaterThan(15);
+      expect(question.sourceRef.length).toBeGreaterThan(3);
+      const source=referenceFor(question.sourceRef);
+      expect(source).toMatchObject({ code: question.sourceRef, url: expect.stringMatching(/^https:\/\//), accessed: "2026-08-27" });
+      expect(source.section.length).toBeGreaterThan(3);
     }
+    const usedSourceRefs=[...new Set(QUESTIONS.map(question=>question.sourceRef))].sort();
+    expect(usedSourceRefs).toEqual([...REGISTERED_SOURCE_REFS]);
+    expect(()=>referenceFor("TFC-NOT-REGISTERED")).toThrow("未登錄來源代碼");
     const answerDistribution = [0, 1, 2, 3].map((answer) => QUESTIONS.filter((question) => question.answer === answer).length);
     expect(Math.min(...answerDistribution)).toBeGreaterThan(25);
+    const uniqueLongestCorrect = QUESTIONS.filter((question) => question.options.every((option, index) => index === question.answer || question.options[question.answer]!.length > option.length));
+    const uniqueShortestCorrect = QUESTIONS.filter((question) => question.options.every((option, index) => index === question.answer || question.options[question.answer]!.length < option.length));
+    expect(uniqueLongestCorrect.length).toBeLessThanOrEqual(30);
+    expect(uniqueShortestCorrect.length).toBeLessThanOrEqual(30);
+    expect(QUESTIONS.some((question) => question.options.some((option) => /作為這次判斷的主要依據|納入最後結論的判斷|依這項線索完成比較|解釋目前看到的差異/.test(option)))).toBe(false);
+    const moduleAnswerSequences = new Set<string>();
+    for (const module of COURSE_MODULES) {
+      const answers = QUESTIONS.filter((question) => question.moduleId === module.id).map((question) => question.answer).join("");
+      moduleAnswerSequences.add(answers);
+      let longestShortPeriodRun = 0;
+      for (let start = 0; start < answers.length; start += 1) {
+        for (let period = 2; period <= 4; period += 1) {
+          let end = start + period;
+          while (end < answers.length && answers[end] === answers[start + ((end - start) % period)]) end += 1;
+          longestShortPeriodRun = Math.max(longestShortPeriodRun, end - start);
+        }
+      }
+      expect(longestShortPeriodRun).toBeLessThanOrEqual(8);
+    }
+    expect(moduleAnswerSequences.size).toBe(COURSE_MODULES.length);
   });
 
   it("能正確計算模組滿分", () => {

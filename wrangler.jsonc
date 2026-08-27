@@ -24,9 +24,9 @@
     }
   },
   "vars": {
-    "COURSE_TITLE": "媒體素養認證 3 小時",
+    "COURSE_TITLE": "媒體素養三小時自學課程",
     "REQUIRED_ACTIVE_SECONDS": "10800",
-    "CERTIFICATE_ISSUER": "媒體素養認證 3 小時課程"
+    "CERTIFICATE_ISSUER": "陳乃誠教師自編課程"
   },
   "observability": {
     "enabled": true,

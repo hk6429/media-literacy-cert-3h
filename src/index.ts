@@ -1,413 +1,59 @@
 import { PASSING_SCORE, grade, publicCourse } from "./course";
-import { CertificationStore, type EnrollInput, type LessonPlan } from "./store";
-
+import { CAPSTONE_REQUIRED_SECONDS, CertificationStore, evidenceIssues, lessonPlanIssues, MODULE_REQUIRED_SECONDS, type EnrollInput, type LessonPlan, type ModuleEvidence } from "./store";
 export { CertificationStore };
 
-type JsonObject = Record<string, unknown>;
-type AnswerInput = { id: string; answer: number };
+type JsonObject=Record<string,unknown>; type AnswerInput={id:string;answer:number};
+const ADMIN_COOKIE="mlc_admin_session",LEARNER_COOKIE="mlc_learner_session",STORE_NAME="media-literacy-cert-3h",MAX_JSON_BYTES=64*1024;
+function store(env:Env){return env.CERTIFICATION_STORE.getByName(STORE_NAME) as DurableObjectStub<CertificationStore>}
+function json(data:unknown,status=200,extra?:HeadersInit){const h=new Headers(extra);h.set("Content-Type","application/json; charset=utf-8");h.set("Cache-Control","no-store");return new Response(JSON.stringify(data),{status,headers:h})}
+function secure(response:Response){const h=new Headers(response.headers);h.set("X-Content-Type-Options","nosniff");h.set("X-Frame-Options","DENY");h.set("Referrer-Policy","strict-origin-when-cross-origin");h.set("Permissions-Policy","camera=(), microphone=(), geolocation=()");h.set("Strict-Transport-Security","max-age=31536000; includeSubDomains");h.set("Content-Security-Policy","default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");return new Response(response.body,{status:response.status,statusText:response.statusText,headers:h})}
+async function readJson(r:Request){const n=Number(r.headers.get("Content-Length")??0);if(Number.isFinite(n)&&n>MAX_JSON_BYTES)throw new Error("PAYLOAD_TOO_LARGE");const b:unknown=await r.json();if(!b||typeof b!=="object"||Array.isArray(b))throw new Error("INVALID_JSON");return b as JsonObject}
+function textField(b:JsonObject,k:string,min:number,max:number){const v=b[k];if(typeof v!=="string")throw new Error("VALIDATION");const n=v.trim().replace(/\s+/g," ");if(n.length<min||n.length>max)throw new Error("VALIDATION");return n}
+function boolField(b:JsonObject,k:string){if(b[k]!==true)throw new Error("VALIDATION");return true}
+function validEmail(v:string){return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)&&v.length<=254}
+function answerList(v:unknown):AnswerInput[]{if(!Array.isArray(v)||v.length>30)throw new Error("VALIDATION");return v.map(x=>{if(!x||typeof x!=="object"||Array.isArray(x))throw new Error("VALIDATION");const r=x as JsonObject;if(typeof r.id!=="string"||!Number.isInteger(r.answer))throw new Error("VALIDATION");return{id:r.id,answer:r.answer as number}})}
+function randomToken(bytes=32){const b=new Uint8Array(bytes);crypto.getRandomValues(b);return base64Url(b)}
+function randomCertificateCode(){return`MLC-${new Date().getFullYear()}-${randomToken(8).replace(/[-_]/g,"X").toUpperCase()}`}
+function base64Url(b:Uint8Array){let s="";for(const x of b)s+=String.fromCharCode(x);return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"")}
+function hex(b:Uint8Array){return[...b].map(x=>x.toString(16).padStart(2,"0")).join("")}
+async function hash(v:string){return hex(new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(v))))}
+async function equal(a:string,b:string){const [x,y]=await Promise.all([hash(a),hash(b)]);return crypto.subtle.timingSafeEqual(new TextEncoder().encode(x),new TextEncoder().encode(y))}
+function cookie(r:Request,name:string){for(const p of (r.headers.get("Cookie")??"").split(";")){const [k,...v]=p.trim().split("=");if(k===name)return v.join("=")}return null}
+function setCookie(name:string,value:string,url:URL,maxAge:number){return`${name}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${url.protocol==="https:"?"; Secure":""}`}
+function requireOrigin(r:Request){const origin=r.headers.get("Origin");if(!origin||origin!==new URL(r.url).origin)throw new Error("FORBIDDEN")}
+async function learnerSessionHash(r:Request){const token=cookie(r,LEARNER_COOKIE);if(!token||token.length<32)throw new Error("UNAUTHORIZED");return hash(token)}
+async function adminSessionHash(r:Request){const token=cookie(r,ADMIN_COOKIE);if(!token||token.length<32)throw new Error("UNAUTHORIZED");return hash(token)}
+function clientIp(r:Request){return r.headers.get("CF-Connecting-IP")??"local"}
+async function ipHash(r:Request,env:Env){return hash(`${clientIp(r)}:${env.SESSION_SECRET}`)}
 
-const ADMIN_COOKIE = "mlc_admin_session";
-const COURSE_STORE_NAME = "media-literacy-cert-3h";
-const MAX_JSON_BYTES = 64 * 1024;
+function base32Decode(value:string){const alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",clean=value.toUpperCase().replace(/[^A-Z2-7]/g,"");let bits="",out:number[]=[];for(const c of clean){const n=alphabet.indexOf(c);if(n<0)throw new Error("VALIDATION");bits+=n.toString(2).padStart(5,"0")}for(let i=0;i+8<=bits.length;i+=8)out.push(Number.parseInt(bits.slice(i,i+8),2));return new Uint8Array(out)}
+async function totp(secret:string,code:string,now=Date.now()):Promise<number|null>{if(!/^\d{6}$/.test(code))return null;const key=await crypto.subtle.importKey("raw",base32Decode(secret),{name:"HMAC",hash:"SHA-1"},false,["sign"]);for(const drift of [-1,0,1]){let counter=Math.floor(now/30000)+drift;const step=counter,data=new Uint8Array(8);for(let i=7;i>=0;i--){data[i]=counter&255;counter=Math.floor(counter/256)}const mac=new Uint8Array(await crypto.subtle.sign("HMAC",key,data)),offset=mac[mac.length-1]!&15,value=(((mac[offset]!&127)<<24)|(mac[offset+1]!<<16)|(mac[offset+2]!<<8)|mac[offset+3]!)%1_000_000;if(await equal(String(value).padStart(6,"0"),code))return step}return null}
 
-function certificationStore(env: Env): DurableObjectStub<CertificationStore> {
-  return env.CERTIFICATION_STORE.getByName(COURSE_STORE_NAME) as DurableObjectStub<CertificationStore>;
+function errorResponse(e:unknown){const m=e instanceof Error?e.message:"UNKNOWN",known:Record<string,[number,string]>={INVALID_JSON:[400,"請求格式錯誤"],VALIDATION:[400,"欄位內容不完整、品質不足或格式錯誤"],PAYLOAD_TOO_LARGE:[413,"資料超過允許大小"],EMAIL_EXISTS:[409,"無法建立紀錄；若曾註冊，請使用復原碼接續進度"],UNAUTHORIZED:[401,"驗證失敗，請重新進入課程"],FORBIDDEN:[403,"沒有權限執行此操作"],INVALID_MODULE:[400,"找不到指定模組"],INVALID_ANSWERS:[400,"請完成本模組全部 25 題"],NOT_ELIGIBLE:[409,"尚未完成各卷時間、評量、實作證據與微教案條件"],RATE_LIMIT:[429,"嘗試次數過多，請稍後再試"]};const [status,message]=known[m]??[500,"系統暫時無法處理，請稍後再試"];return json({ok:false,error:message},status)}
+async function requireAdmin(r:Request,env:Env){const h=await adminSessionHash(r),username=await store(env).validAdminSession(h);if(!username)throw new Error("UNAUTHORIZED");return{hash:h,username}}
+
+async function api(r:Request,env:Env){const url=new URL(r.url),path=url.pathname,s=store(env);if(!["GET","HEAD"].includes(r.method))requireOrigin(r);
+  if(r.method==="GET"&&path==="/api/course")return json({ok:true,course:publicCourse(),title:env.COURSE_TITLE,requiredActiveSeconds:10800,moduleRequiredSeconds:MODULE_REQUIRED_SECONDS,capstoneRequiredSeconds:CAPSTONE_REQUIRED_SECONDS,issuer:env.CERTIFICATE_ISSUER});
+  if(r.method==="POST"&&path==="/api/enroll"){const b=await readJson(r),name=textField(b,"name",2,60),school=textField(b,"school",2,100),email=textField(b,"email",5,254).toLowerCase();if(!validEmail(email)||b.consent!==true||String(b.website??"")!=="")throw new Error("VALIDATION");const ip=await ipHash(r,env);if(!await s.canEnroll(ip,Date.now()))throw new Error("RATE_LIMIT");const session=randomToken(),recovery=randomToken(18),legacy=randomToken(),input:EnrollInput={id:crypto.randomUUID(),tokenHash:await hash(legacy),sessionHash:await hash(session),recoveryHash:await hash(recovery),name,school,email,consentAt:Date.now()};const result=await s.enroll(input);if(!result.ok)throw new Error(result.error);await s.recordEnrollAttempt(ip,Date.now());return json({ok:true,recoveryCode:recovery},201,{"Set-Cookie":setCookie(LEARNER_COOKIE,session,url,2592000)});}
+  if(r.method==="POST"&&path==="/api/session/migrate"){const auth=r.headers.get("Authorization")??"";if(!auth.startsWith("Bearer "))throw new Error("UNAUTHORIZED");const session=randomToken(),recovery=randomToken(18);if(!await s.createSessionFromLegacy(await hash(auth.slice(7).trim()),await hash(session),await hash(recovery)))throw new Error("UNAUTHORIZED");return json({ok:true,recoveryCode:recovery},200,{"Set-Cookie":setCookie(LEARNER_COOKIE,session,url,2592000)});}
+  if(r.method==="POST"&&path==="/api/session/recover"){const key=`recover:${await ipHash(r,env)}`;if(!await s.canAttemptAdminLogin(key,Date.now()))throw new Error("RATE_LIMIT");const b=await readJson(r),old=textField(b,"recoveryCode",20,80),next=randomToken(18),session=randomToken(),success=await s.recover(await hash(old),await hash(next),await hash(session));await s.recordAdminLogin(key,success,Date.now());if(!success)throw new Error("UNAUTHORIZED");return json({ok:true,recoveryCode:next},200,{"Set-Cookie":setCookie(LEARNER_COOKIE,session,url,2592000)});}
+  if(r.method==="POST"&&path==="/api/session/logout"){const h=await learnerSessionHash(r);await s.revokeLearnerSession(h);return json({ok:true},200,{"Set-Cookie":setCookie(LEARNER_COOKIE,"",url,0)});}
+  if(r.method==="DELETE"&&path==="/api/me"){if(!await s.deleteLearner(await learnerSessionHash(r)))throw new Error("UNAUTHORIZED");return json({ok:true},200,{"Set-Cookie":setCookie(LEARNER_COOKIE,"",url,0)});}
+  if(r.method==="GET"&&path==="/api/me"){const learner=await s.getLearnerBySession(await learnerSessionHash(r));if(!learner)throw new Error("UNAUTHORIZED");return json({ok:true,learner});}
+  if(r.method==="POST"&&path==="/api/heartbeat"){const b=await readJson(r),context=textField(b,"moduleId",3,40),result=await s.heartbeatBySession(await learnerSessionHash(r),Date.now(),context);return json({ok:true,...result});}
+  const moduleMatch=path.match(/^\/api\/modules\/([a-z-]+)\/submit$/);if(r.method==="POST"&&moduleMatch){const id=moduleMatch[1]!,b=await readJson(r),result=grade(id,answerList(b.answers));await s.recordModuleScoreBySession(await learnerSessionHash(r),id,result.score,PASSING_SCORE);return json({ok:true,...result,passed:result.score>=PASSING_SCORE});}
+  const evidenceMatch=path.match(/^\/api\/modules\/([a-z-]+)\/evidence$/);if(r.method==="POST"&&evidenceMatch){const b=await readJson(r),evidence:ModuleEvidence={subject:textField(b,"subject",10,300),observation:textField(b,"observation",30,800),judgement:textField(b,"judgement",30,800),limitation:textField(b,"limitation",20,600)};if(evidenceIssues(evidence).length)throw new Error("VALIDATION");await s.saveEvidence(await learnerSessionHash(r),evidenceMatch[1]!,JSON.stringify(evidence));return json({ok:true});}
+  if(r.method==="POST"&&path==="/api/lesson-plan"){const b=await readJson(r),plan:LessonPlan={title:textField(b,"title",1,100),audience:textField(b,"audience",2,80),objective:textField(b,"objective",1,500),activity:textField(b,"activity",1,1800),assessment:textField(b,"assessment",1,800),sourceChecked:boolField(b,"sourceChecked"),studentOutput:boolField(b,"studentOutput"),privacyChecked:boolField(b,"privacyChecked")},issues=lessonPlanIssues(plan);if(issues.length)return json({ok:false,error:"微教案尚未通過品質檢核",details:issues},400);await s.saveLessonPlanBySession(await learnerSessionHash(r),plan);return json({ok:true});}
+  if(r.method==="POST"&&path==="/api/certificate/issue"){const result=await s.issueCertificateBySession(await learnerSessionHash(r),randomCertificateCode(),PASSING_SCORE);if(!result.ok)throw new Error(result.error);return json({...result,issuer:env.CERTIFICATE_ISSUER,title:env.COURSE_TITLE});}
+  if(r.method==="GET"&&path==="/api/certificate"){const l=await s.getLearnerBySession(await learnerSessionHash(r));if(!l?.certificateCode||!l.completedAt)throw new Error("NOT_ELIGIBLE");return json({ok:true,certificate:{name:l.name,school:l.school,code:l.certificateCode,completedAt:l.completedAt,title:env.COURSE_TITLE,issuer:env.CERTIFICATE_ISSUER,hours:3}});}
+  const verify=path.match(/^\/api\/verify\/([A-Z0-9-]{12,40})$/i);if(r.method==="GET"&&verify)return json({ok:true,certificate:await s.verifyCertificate(verify[1]!.toUpperCase())});
+  if(r.method==="POST"&&path==="/api/admin/login"){if(!env.ADMIN_USERNAME||!env.ADMIN_PASSWORD||!env.ADMIN_TOTP_SECRET||!env.SESSION_SECRET)return json({ok:false,error:"管理端尚未完成設定"},503);const key=await ipHash(r,env);if(!await s.canAttemptAdminLogin(key,Date.now()))return json({ok:false,error:"嘗試次數過多，請 15 分鐘後再試"},429);const b=await readJson(r),username=textField(b,"username",2,80),password=textField(b,"password",8,200),otp=textField(b,"otp",6,6),step=await totp(env.ADMIN_TOTP_SECRET,otp),credentials=await equal(username,env.ADMIN_USERNAME)&&await equal(password,env.ADMIN_PASSWORD),success=credentials&&step!==null&&await s.useAdminTotp(username,step);await s.recordAdminLogin(key,success,Date.now());await s.audit(username,success?"login_success":"login_failure","管理端登入",key);if(!success)throw new Error("UNAUTHORIZED");const token=randomToken(),expires=Date.now()+8*3600000;await s.createAdminSession(await hash(token),username,expires);return json({ok:true},200,{"Set-Cookie":setCookie(ADMIN_COOKIE,token,url,28800)});}
+  if(r.method==="POST"&&path==="/api/admin/logout"){let session:{hash:string;username:string}|null=null;try{session=await requireAdmin(r,env)}catch{}if(session)await s.revokeAdminSession(session.hash);return json({ok:true},200,{"Set-Cookie":setCookie(ADMIN_COOKIE,"",url,0)});}
+  if(path.startsWith("/api/admin/")){const session=await requireAdmin(r,env),action=path.split("/").at(-1)??"admin";await s.audit(session.username,`access_${action}`,r.method,await ipHash(r,env));}
+  if(r.method==="GET"&&path==="/api/admin/stats")return json({ok:true,stats:await s.adminStats()});
+  if(r.method==="GET"&&path==="/api/admin/completions"){const q=(url.searchParams.get("q")??"").trim().slice(0,100),limit=Number(url.searchParams.get("limit")??50),offset=Number(url.searchParams.get("offset")??0);return json({ok:true,...await s.listCompletions(q,Number.isFinite(limit)?limit:50,Number.isFinite(offset)?offset:0)});}
+  if(r.method==="GET"&&path==="/api/admin/export.csv"){const all=[];let offset=0;while(true){const p=await s.listCompletions("",200,offset);all.push(...p.rows);offset+=p.rows.length;if(offset>=p.total||!p.rows.length)break}const rows=[["姓名","學校","Email","有效學習分鐘","六卷評量平均","完成時間","證明編號"],...all.map(x=>[x.name,x.school,x.email,String(Math.floor(x.active_seconds/60)),String(x.final_score),new Date(x.completed_at).toISOString(),x.certificate_code])],csv=`\uFEFF${rows.map(row=>row.map(csvCell).join(",")).join("\r\n")}`;return new Response(csv,{headers:{"Content-Type":"text/csv; charset=utf-8","Content-Disposition":`attachment; filename="media-literacy-completions-${new Date().toISOString().slice(0,10)}.csv"`,"Cache-Control":"no-store"}});}
+  return json({ok:false,error:"找不到指定功能"},404);
 }
-
-function json(data: unknown, status = 200, extraHeaders?: HeadersInit): Response {
-  const headers = new Headers(extraHeaders);
-  headers.set("Content-Type", "application/json; charset=utf-8");
-  headers.set("Cache-Control", "no-store");
-  return new Response(JSON.stringify(data), { status, headers });
-}
-
-function withSecurityHeaders(response: Response): Response {
-  const headers = new Headers(response.headers);
-  headers.set("X-Content-Type-Options", "nosniff");
-  headers.set("X-Frame-Options", "DENY");
-  headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
-  headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-  headers.set(
-    "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
-  );
-  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
-}
-
-async function readJson(request: Request): Promise<JsonObject> {
-  const length = Number(request.headers.get("Content-Length") ?? 0);
-  if (Number.isFinite(length) && length > MAX_JSON_BYTES) throw new Error("PAYLOAD_TOO_LARGE");
-  const body: unknown = await request.json();
-  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("INVALID_JSON");
-  return body as JsonObject;
-}
-
-function textField(body: JsonObject, key: string, min: number, max: number): string {
-  const value = body[key];
-  if (typeof value !== "string") throw new Error("VALIDATION");
-  const normalized = value.trim().replace(/\s+/g, " ");
-  if (normalized.length < min || normalized.length > max) throw new Error("VALIDATION");
-  return normalized;
-}
-
-function validEmail(value: string): boolean {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) && value.length <= 254;
-}
-
-function answerList(value: unknown): AnswerInput[] {
-  if (!Array.isArray(value) || value.length > 30) throw new Error("VALIDATION");
-  return value.map((item) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("VALIDATION");
-    const record = item as JsonObject;
-    if (typeof record.id !== "string" || !Number.isInteger(record.answer)) throw new Error("VALIDATION");
-    return { id: record.id, answer: record.answer as number };
-  });
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function randomToken(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return base64Url(bytes);
-}
-
-function randomCertificateCode(): string {
-  const bytes = new Uint8Array(8);
-  crypto.getRandomValues(bytes);
-  return `ML3-${new Date().getFullYear()}-${bytesToHex(bytes).toUpperCase()}`;
-}
-
-function base64Url(input: Uint8Array): string {
-  let binary = "";
-  for (const byte of input) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
-function base64UrlText(input: string): string {
-  return base64Url(new TextEncoder().encode(input));
-}
-
-function decodeBase64UrlText(input: string): string {
-  const padded = input.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(input.length / 4) * 4, "=");
-  const binary = atob(padded);
-  return new TextDecoder().decode(Uint8Array.from(binary, (character) => character.charCodeAt(0)));
-}
-
-async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return bytesToHex(new Uint8Array(digest));
-}
-
-async function secureEqual(left: string, right: string): Promise<boolean> {
-  const [leftHash, rightHash] = await Promise.all([sha256Hex(left), sha256Hex(right)]);
-  return crypto.subtle.timingSafeEqual(
-    new TextEncoder().encode(leftHash),
-    new TextEncoder().encode(rightHash),
-  );
-}
-
-async function hmac(value: string, secret: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
-  return base64Url(new Uint8Array(signature));
-}
-
-async function createAdminSession(secret: string): Promise<string> {
-  const payload = base64UrlText(JSON.stringify({ exp: Date.now() + 8 * 60 * 60 * 1000 }));
-  return `${payload}.${await hmac(payload, secret)}`;
-}
-
-async function verifyAdminSession(token: string | null, secret: string): Promise<boolean> {
-  if (!token) return false;
-  const [payload, signature, extra] = token.split(".");
-  if (!payload || !signature || extra) return false;
-  const expected = await hmac(payload, secret);
-  if (!(await secureEqual(signature, expected))) return false;
-  try {
-    const data: unknown = JSON.parse(decodeBase64UrlText(payload));
-    return !!data && typeof data === "object" && typeof (data as JsonObject).exp === "number"
-      && ((data as JsonObject).exp as number) > Date.now();
-  } catch {
-    return false;
-  }
-}
-
-function cookieValue(request: Request, name: string): string | null {
-  const cookie = request.headers.get("Cookie");
-  if (!cookie) return null;
-  for (const part of cookie.split(";")) {
-    const [key, ...value] = part.trim().split("=");
-    if (key === name) return value.join("=");
-  }
-  return null;
-}
-
-function bearerToken(request: Request): string {
-  const authorization = request.headers.get("Authorization") ?? "";
-  if (!authorization.startsWith("Bearer ")) throw new Error("UNAUTHORIZED");
-  const token = authorization.slice(7).trim();
-  if (token.length < 32 || token.length > 128) throw new Error("UNAUTHORIZED");
-  return token;
-}
-
-async function learnerHash(request: Request): Promise<string> {
-  return sha256Hex(bearerToken(request));
-}
-
-function ensureSameOrigin(request: Request): void {
-  const origin = request.headers.get("Origin");
-  if (origin && origin !== new URL(request.url).origin) throw new Error("FORBIDDEN");
-}
-
-function errorResponse(error: unknown): Response {
-  const message = error instanceof Error ? error.message : "UNKNOWN";
-  const known: Record<string, [number, string]> = {
-    INVALID_JSON: [400, "請求格式錯誤"],
-    VALIDATION: [400, "欄位內容不完整或格式錯誤"],
-    PAYLOAD_TOO_LARGE: [413, "資料超過允許大小"],
-    EMAIL_EXISTS: [409, "這個 Email 已有學習紀錄，請使用原瀏覽器或洽管理員"],
-    UNAUTHORIZED: [401, "驗證失敗，請重新進入課程"],
-    FORBIDDEN: [403, "沒有權限執行此操作"],
-    INVALID_MODULE: [400, "找不到指定模組"],
-    INVALID_ANSWERS: [400, "請完成本模組全部 25 題"],
-    NOT_ELIGIBLE: [409, "尚未達到證書核發條件"],
-    "答案數量不完整": [400, "請完成所有題目"],
-    "題目不可重複": [400, "題目資料錯誤"],
-    "答案格式錯誤": [400, "答案格式錯誤"],
-  };
-  const [status, publicMessage] = known[message] ?? [500, "系統暫時無法處理，請稍後再試"];
-  if (status === 500) console.error(JSON.stringify({ message: "request failed", error: message }));
-  return json({ ok: false, error: publicMessage }, status);
-}
-
-async function requireAdmin(request: Request, env: Env): Promise<void> {
-  if (!env.SESSION_SECRET) throw new Error("SERVER_NOT_CONFIGURED");
-  const valid = await verifyAdminSession(cookieValue(request, ADMIN_COOKIE), env.SESSION_SECRET);
-  if (!valid) throw new Error("UNAUTHORIZED");
-}
-
-async function handleApi(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const path = url.pathname;
-  const store = certificationStore(env);
-
-  if (request.method !== "GET") ensureSameOrigin(request);
-
-  if (request.method === "GET" && path === "/api/course") {
-    return json({
-      ok: true,
-      course: publicCourse(),
-      title: env.COURSE_TITLE,
-      requiredActiveSeconds: Number(env.REQUIRED_ACTIVE_SECONDS),
-      issuer: env.CERTIFICATE_ISSUER,
-    });
-  }
-
-  if (request.method === "POST" && path === "/api/enroll") {
-    const body = await readJson(request);
-    const name = textField(body, "name", 2, 60);
-    const school = textField(body, "school", 2, 100);
-    const email = textField(body, "email", 5, 254).toLowerCase();
-    if (!validEmail(email) || body.consent !== true) throw new Error("VALIDATION");
-    const token = randomToken();
-    const input: EnrollInput = {
-      id: crypto.randomUUID(),
-      tokenHash: await sha256Hex(token),
-      name,
-      school,
-      email,
-      consentAt: Date.now(),
-    };
-    const enrolled = await store.enroll(input);
-    if (!enrolled.ok) throw new Error(enrolled.error);
-    return json({ ok: true, token }, 201);
-  }
-
-  if (request.method === "GET" && path === "/api/me") {
-    const learner = await store.getLearner(await learnerHash(request));
-    if (!learner) throw new Error("UNAUTHORIZED");
-    return json({ ok: true, learner });
-  }
-
-  if (request.method === "POST" && path === "/api/heartbeat") {
-    const body = await readJson(request);
-    const moduleId = textField(body, "moduleId", 3, 40);
-    const result = await store.heartbeat(await learnerHash(request), Date.now(), moduleId);
-    return json({ ok: true, ...result });
-  }
-
-  const moduleMatch = path.match(/^\/api\/modules\/([a-z-]+)\/submit$/);
-  if (request.method === "POST" && moduleMatch) {
-    const moduleId = moduleMatch[1]!;
-    const body = await readJson(request);
-    const result = grade(moduleId, answerList(body.answers));
-    await store.recordModuleScore(await learnerHash(request), moduleId, result.score, PASSING_SCORE);
-    return json({ ok: true, ...result, passed: result.score >= PASSING_SCORE });
-  }
-
-  if (request.method === "POST" && path === "/api/lesson-plan") {
-    const body = await readJson(request);
-    const plan: LessonPlan = {
-      title: textField(body, "title", 4, 100),
-      audience: textField(body, "audience", 2, 80),
-      objective: textField(body, "objective", 10, 500),
-      activity: textField(body, "activity", 20, 1500),
-      assessment: textField(body, "assessment", 10, 800),
-    };
-    await store.saveLessonPlan(await learnerHash(request), plan);
-    return json({ ok: true });
-  }
-
-  if (request.method === "POST" && path === "/api/certificate/issue") {
-    const result = await store.issueCertificate(
-      await learnerHash(request),
-      randomCertificateCode(),
-      Number(env.REQUIRED_ACTIVE_SECONDS),
-      PASSING_SCORE,
-    );
-    if (!result.ok) throw new Error(result.error);
-    return json({ ...result, issuer: env.CERTIFICATE_ISSUER, title: env.COURSE_TITLE });
-  }
-
-  if (request.method === "GET" && path === "/api/certificate") {
-    const learner = await store.getLearner(await learnerHash(request));
-    if (!learner?.certificateCode || !learner.completedAt) throw new Error("NOT_ELIGIBLE");
-    return json({
-      ok: true,
-      certificate: {
-        name: learner.name,
-        school: learner.school,
-        code: learner.certificateCode,
-        completedAt: learner.completedAt,
-        title: env.COURSE_TITLE,
-        issuer: env.CERTIFICATE_ISSUER,
-        hours: 3,
-      },
-    });
-  }
-
-  const verifyMatch = path.match(/^\/api\/verify\/([A-Z0-9-]{12,40})$/i);
-  if (request.method === "GET" && verifyMatch) {
-    return json({ ok: true, certificate: await store.verifyCertificate(verifyMatch[1]!.toUpperCase()) });
-  }
-
-  if (request.method === "POST" && path === "/api/admin/login") {
-    if (!env.ADMIN_PASSWORD || !env.SESSION_SECRET) return json({ ok: false, error: "管理端尚未完成設定" }, 503);
-    const ip = request.headers.get("CF-Connecting-IP") ?? "local";
-    const loginKey = await sha256Hex(`${ip}:${env.SESSION_SECRET}`);
-    if (!(await store.canAttemptAdminLogin(loginKey, Date.now()))) {
-      return json({ ok: false, error: "嘗試次數過多，請 15 分鐘後再試" }, 429);
-    }
-    const body = await readJson(request);
-    const password = textField(body, "password", 8, 200);
-    const success = await secureEqual(password, env.ADMIN_PASSWORD);
-    await store.recordAdminLogin(loginKey, success, Date.now());
-    if (!success) throw new Error("UNAUTHORIZED");
-    const session = await createAdminSession(env.SESSION_SECRET);
-    const secure = url.protocol === "https:" ? "; Secure" : "";
-    return json({ ok: true }, 200, {
-      "Set-Cookie": `${ADMIN_COOKIE}=${session}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800${secure}`,
-    });
-  }
-
-  if (request.method === "POST" && path === "/api/admin/logout") {
-    return json({ ok: true }, 200, {
-      "Set-Cookie": `${ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`,
-    });
-  }
-
-  if (path.startsWith("/api/admin/")) await requireAdmin(request, env);
-
-  if (request.method === "GET" && path === "/api/admin/stats") {
-    return json({ ok: true, stats: await store.adminStats() });
-  }
-
-  if (request.method === "GET" && path === "/api/admin/completions") {
-    const search = (url.searchParams.get("q") ?? "").trim().slice(0, 100);
-    const limit = Number(url.searchParams.get("limit") ?? 50);
-    const offset = Number(url.searchParams.get("offset") ?? 0);
-    const result = await store.listCompletions(search, Number.isFinite(limit) ? limit : 50, Number.isFinite(offset) ? offset : 0);
-    return json({ ok: true, ...result });
-  }
-
-  if (request.method === "GET" && path === "/api/admin/export.csv") {
-    const allRows = [];
-    let offset = 0;
-    while (true) {
-      const page = await store.listCompletions("", 200, offset);
-      allRows.push(...page.rows);
-      offset += page.rows.length;
-      if (offset >= page.total || page.rows.length === 0) break;
-    }
-    const csvRows = [
-      ["姓名", "學校", "Email", "有效學習分鐘", "六卷評量平均", "完成時間", "證書編號"],
-      ...allRows.map((row) => [
-        row.name,
-        row.school,
-        row.email,
-        String(Math.floor(row.active_seconds / 60)),
-        String(row.final_score),
-        new Date(row.completed_at).toISOString(),
-        row.certificate_code,
-      ]),
-    ];
-    const csv = `\uFEFF${csvRows.map((row) => row.map(csvCell).join(",")).join("\r\n")}`;
-    return new Response(csv, {
-      headers: {
-        "Content-Type": "text/csv; charset=utf-8",
-        "Content-Disposition": `attachment; filename="media-literacy-completions-${new Date().toISOString().slice(0, 10)}.csv"`,
-        "Cache-Control": "no-store",
-      },
-    });
-  }
-
-  return json({ ok: false, error: "找不到指定功能" }, 404);
-}
-
-function csvCell(value: string): string {
-  const protectedValue = /^[=+\-@]/.test(value) ? `'${value}` : value;
-  return `"${protectedValue.replaceAll('"', '""')}"`;
-}
-
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const requestId = crypto.randomUUID();
-    const startedAt = Date.now();
-    try {
-      const url = new URL(request.url);
-      const response = url.pathname.startsWith("/api/")
-        ? await handleApi(request, env)
-        : await env.ASSETS.fetch(request);
-      console.log(JSON.stringify({
-        message: "request completed",
-        requestId,
-        method: request.method,
-        path: url.pathname,
-        status: response.status,
-        durationMs: Date.now() - startedAt,
-      }));
-      return withSecurityHeaders(response);
-    } catch (error) {
-      const response = errorResponse(error);
-      console.error(JSON.stringify({
-        message: "request failed",
-        requestId,
-        method: request.method,
-        path: new URL(request.url).pathname,
-        status: response.status,
-        durationMs: Date.now() - startedAt,
-        error: error instanceof Error ? error.message : String(error),
-      }));
-      return withSecurityHeaders(response);
-    }
-  },
-} satisfies ExportedHandler<Env>;
+function csvCell(v:string){const safe=/^[=+\-@]/.test(v)?`'${v}`:v;return`"${safe.replaceAll('"','""')}"`}
+export default{async fetch(r:Request,env:Env){try{return secure(new URL(r.url).pathname.startsWith("/api/")?await api(r,env):await env.ASSETS.fetch(r))}catch(e){console.error(JSON.stringify({message:"request failed",path:new URL(r.url).pathname,error:e instanceof Error?e.message:String(e)}));return secure(errorResponse(e))}}} satisfies ExportedHandler<Env>;
